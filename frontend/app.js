@@ -1,126 +1,159 @@
-const API_URL = "/api/predict";
+const fileBox = document.getElementById('fileBox');
+const fileInput = document.getElementById('fileInput');
+const previewImage = document.getElementById('previewImage');
+const uploadPrompt = document.getElementById('uploadPrompt');
+const webcam = document.getElementById('webcam');
+const snapshotCanvas = document.getElementById('snapshotCanvas');
+const scanBtn = document.getElementById('scanBtn');
+const scannerLine = document.getElementById('scannerLine');
+const hudResult = document.getElementById('hudResult');
+const mainLabel = document.getElementById('mainLabel');
+const latencyText = document.getElementById('latencyText');
+const top3List = document.getElementById('top3List');
+const voiceToggle = document.getElementById('voiceToggle');
 
-let selectedFile = null;
+const btnUploadMode = document.getElementById('btnUploadMode');
+const btnCamMode = document.getElementById('btnCamMode');
 
-const dropZone = document.getElementById("drop-zone");
-const fileInput = document.getElementById("file-input");
-const previewWrapper = document.getElementById("preview-wrapper");
-const imagePreview = document.getElementById("image-preview");
-const btnClear = document.getElementById("btn-clear");
-const btnAnalyze = document.getElementById("btn-analyze");
+let currentMode = 'upload'; // 'upload' or 'webcam'
+let webcamStream = null;
+let voiceEnabled = true;
+let selectedBlob = null;
 
-const predClass = document.getElementById("pred-class");
-const predVerdict = document.getElementById("pred-verdict");
-const badgeStatus = document.getElementById("badge-status");
-const scoreDog = document.getElementById("score-dog");
-const barDog = document.getElementById("bar-dog");
-const scoreCat = document.getElementById("score-cat");
-const barCat = document.getElementById("bar-cat");
-
-dropZone.addEventListener("click", () => fileInput.click());
-
-dropZone.addEventListener("dragover", (e) => {
-    e.preventDefault();
-    dropZone.classList.add("border-indigo-500", "bg-indigo-950/20");
-});
-
-dropZone.addEventListener("dragleave", () => {
-    dropZone.classList.remove("border-indigo-500", "bg-indigo-950/20");
-});
-
-dropZone.addEventListener("drop", (e) => {
-    e.preventDefault();
-    dropZone.classList.remove("border-indigo-500", "bg-indigo-950/20");
-    if (e.dataTransfer.files && e.dataTransfer.files.length > 0) {
-        handleFileSelect(e.dataTransfer.files[0]);
-    }
-});
-
-fileInput.addEventListener("change", (e) => {
-    if (e.target.files && e.target.files.length > 0) {
-        handleFileSelect(e.target.files[0]);
-    }
-});
-
-btnClear.addEventListener("click", resetSelection);
-
-function handleFileSelect(file) {
-    if (!file.type.startsWith("image/")) {
-        alert("Please select a valid image file (PNG/JPG).");
-        return;
-    }
-
-    selectedFile = file;
-    const reader = new FileReader();
-    reader.onload = (event) => {
-        imagePreview.src = event.target.result;
-        previewWrapper.classList.remove("hidden");
-        btnAnalyze.disabled = false;
-        btnAnalyze.textContent = "⚡ Classify with Deep CNN";
-    };
-    reader.readAsDataURL(file);
+// Sci-Fi Beep Sound via Web Audio API
+function playBeep() {
+    try {
+        const audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+        const osc = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc.type = 'sine';
+        osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+        osc.frequency.exponentialRampToValueAtTime(1200, audioCtx.currentTime + 0.1);
+        gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.01, audioCtx.currentTime + 0.1);
+        osc.connect(gain);
+        gain.connect(audioCtx.destination);
+        osc.start();
+        osc.stop(audioCtx.currentTime + 0.12);
+    } catch(e) {}
 }
 
-function resetSelection() {
-    selectedFile = null;
-    fileInput.value = "";
-    imagePreview.src = "";
-    previewWrapper.classList.add("hidden");
-    btnAnalyze.disabled = true;
-
-    predClass.textContent = "--";
-    predVerdict.textContent = "Upload a picture to begin inference";
-    badgeStatus.textContent = "Waiting for Image";
-    badgeStatus.className = "text-[11px] font-mono px-2 py-0.5 rounded bg-slate-800 text-slate-400";
-    
-    scoreDog.textContent = "0.00%";
-    barDog.style.width = "0%";
-    scoreCat.textContent = "0.00%";
-    barCat.style.width = "0%";
+// AI Speech synthesis
+function speakResult(text) {
+    if (!voiceEnabled || !('speechSynthesis' in window)) return;
+    window.speechSynthesis.cancel();
+    const utterance = new SpeechSynthesisUtterance(text);
+    utterance.rate = 1.05;
+    utterance.pitch = 0.9; // Slightly deep tech pitch
+    window.speechSynthesis.speak(utterance);
 }
 
-btnAnalyze.addEventListener("click", async () => {
-    if (!selectedFile) return;
+voiceToggle.addEventListener('click', () => {
+    voiceEnabled = !voiceEnabled;
+    voiceToggle.innerText = voiceEnabled ? '🔊 AI Voice: ON' : '🔇 AI Voice: OFF';
+});
 
-    btnAnalyze.disabled = true;
-    btnAnalyze.textContent = "⏳ Computing Feature Maps...";
-    badgeStatus.textContent = "Inferring...";
+// Mode Switching
+btnUploadMode.addEventListener('click', () => {
+    currentMode = 'upload';
+    btnUploadMode.className = 'flex-1 py-2 text-xs uppercase tracking-wider rounded-xl bg-cyan-500/20 border border-cyan-500 text-cyan-300 font-bold';
+    btnCamMode.className = 'flex-1 py-2 text-xs uppercase tracking-wider rounded-xl bg-slate-900 border border-slate-800 text-slate-400 font-bold';
+    fileBox.classList.remove('hidden');
+    webcam.classList.add('hidden');
+    if (webcamStream) {
+        webcamStream.getTracks().forEach(t => t.stop());
+        webcamStream = null;
+    }
+});
 
-    const formData = new FormData();
-    formData.append("file", selectedFile);
+btnCamMode.addEventListener('click', async () => {
+    currentMode = 'webcam';
+    btnCamMode.className = 'flex-1 py-2 text-xs uppercase tracking-wider rounded-xl bg-cyan-500/20 border border-cyan-500 text-cyan-300 font-bold';
+    btnUploadMode.className = 'flex-1 py-2 text-xs uppercase tracking-wider rounded-xl bg-slate-900 border border-slate-800 text-slate-400 font-bold';
+    fileBox.classList.add('hidden');
+    webcam.classList.remove('hidden');
 
     try {
-        const response = await fetch(API_URL, {
-            method: "POST",
-            body: formData,
+        webcamStream = await navigator.mediaDevices.getUserMedia({ video: { facingMode: 'user' } });
+        webcam.srcObject = webcamStream;
+    } catch (err) {
+        alert('Webcam access denied or unavailable.');
+    }
+});
+
+// File Upload Logic
+fileBox.addEventListener('click', () => fileInput.click());
+fileInput.addEventListener('change', (e) => {
+    if (e.target.files[0]) {
+        selectedBlob = e.target.files[0];
+        previewImage.src = URL.createObjectURL(selectedBlob);
+        previewImage.classList.remove('hidden');
+        uploadPrompt.classList.add('hidden');
+    }
+});
+
+// Trigger Scan
+scanBtn.addEventListener('click', async () => {
+    let blobToSend = null;
+
+    if (currentMode === 'upload') {
+        if (!selectedBlob) {
+            alert('Please select or drop an image first!');
+            return;
+        }
+        blobToSend = selectedBlob;
+    } else {
+        // Capture frame from webcam
+        const canvas = snapshotCanvas;
+        canvas.width = webcam.videoWidth || 640;
+        canvas.height = webcam.videoHeight || 480;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(webcam, 0, 0, canvas.width, canvas.height);
+        blobToSend = await new Promise(r => canvas.toBlob(r, 'image/jpeg'));
+    }
+
+    playBeep();
+    scanBtn.disabled = true;
+    scanBtn.innerText = 'NEURAL ANALYZING...';
+    scannerLine.classList.remove('hidden');
+
+    const formData = new FormData();
+    formData.append('file', blobToSend, 'scan.jpg');
+
+    try {
+        const res = await fetch('/predict', { method: 'POST', body: formData });
+        if (!res.ok) throw new Error('Inference failure');
+        const data = await res.json();
+
+        playBeep();
+        hudResult.classList.remove('hidden');
+        mainLabel.innerText = data.primary_class;
+        latencyText.innerText = `${data.latency_ms} ms`;
+
+        // Render Top-3 probability bars
+        top3List.innerHTML = '';
+        data.top_3.forEach((item, idx) => {
+            const row = document.createElement('div');
+            row.className = 'space-y-1';
+            row.innerHTML = `
+                <div class="flex justify-between text-xs text-slate-300">
+                    <span>${idx + 1}. ${item.label}</span>
+                    <span class="font-bold text-cyan-400">${item.confidence}%</span>
+                </div>
+                <div class="w-full bg-slate-800 rounded-full h-1.5 overflow-hidden">
+                    <div class="bg-cyan-400 h-full rounded-full transition-all duration-700" style="width: ${item.confidence}%"></div>
+                </div>
+            `;
+            top3List.appendChild(row);
         });
 
-        if (!response.ok) {
-            const errData = await response.json().catch(() => ({}));
-            throw new Error(errData.detail || "Prediction failed");
-        }
+        speakResult(`Target identified: ${data.primary_class}, certainty ${data.confidence} percent.`);
 
-        const data = await response.json();
-
-        const isCat = data.label === "Cat";
-        predClass.textContent = isCat ? "🐱 Cat" : "🐶 Dog";
-        predClass.className = isCat ? "text-3xl font-black text-purple-400" : "text-3xl font-black text-indigo-400";
-        predVerdict.textContent = `${data.verdict} • ${data.latency_ms}ms`;
-
-        badgeStatus.textContent = `Completed (${data.confidence}%)`;
-        badgeStatus.className = "text-[11px] font-mono px-2 py-0.5 rounded bg-emerald-500/20 text-emerald-400 border border-emerald-500/30";
-
-        scoreDog.textContent = `${data.dog_probability}%`;
-        barDog.style.width = `${data.dog_probability}%`;
-
-        scoreCat.textContent = `${data.cat_probability}%`;
-        barCat.style.width = `${data.cat_probability}%`;
-
-    } catch (err) {
-        alert(`Inference failed: ${err.message}`);
-        badgeStatus.textContent = "Failed";
+    } catch (e) {
+        alert(e.message);
     } finally {
-        btnAnalyze.disabled = false;
-        btnAnalyze.textContent = "⚡ Classify with Deep CNN";
+        scannerLine.classList.add('hidden');
+        scanBtn.disabled = false;
+        scanBtn.innerText = '⚡ INITIATE SCAN';
     }
 });

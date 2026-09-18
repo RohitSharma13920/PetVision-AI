@@ -1,17 +1,16 @@
 import io
-import os
 import time
-import numpy as np
-from PIL import Image
-
-import torch
-import torch.nn as nn
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse, Response
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import List
+from PIL import Image
+import torch
+import torch.nn.functional as F
+from torchvision.models import mobilenet_v2, MobileNet_V2_Weights
 
-app = FastAPI(title="PetVision AI - Advanced PyTorch CNN", version="2.0.0")
+app = FastAPI(title="PetVision Neural HUD", version="4.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -21,121 +20,58 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-PROJECT_ROOT = os.path.abspath(os.path.join(BASE_DIR, ".."))
-FRONTEND_DIR = os.path.join(PROJECT_ROOT, "frontend")
-
-# 1. 4-Stage Architecture matching training
-class PetVisionCNN(nn.Module):
-    def __init__(self):
-        super(PetVisionCNN, self).__init__()
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(32, 64, kernel_size=3, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-
-            nn.Conv2d(128, 128, kernel_size=3, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((2, 2)),
-        )
-        self.classifier = nn.Sequential(
-            nn.Flatten(),
-            nn.Dropout(0.3),
-            nn.Linear(128 * 2 * 2, 64),
-            nn.ReLU(inplace=True),
-            nn.Dropout(0.2),
-            nn.Linear(64, 2),
-        )
-
-    def forward(self, x):
-        return self.classifier(self.features(x))
-
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = PetVisionCNN().to(device)
-
-weights_path = os.path.join(PROJECT_ROOT, "models", "cat_dog_cnn.pth")
-if not os.path.exists(weights_path):
-    weights_path = "models/cat_dog_cnn.pth"
-
-model.load_state_dict(torch.load(weights_path, map_location=device))
+# Load lightweight MobileNetV2
+weights = MobileNet_V2_Weights.DEFAULT
+model = mobilenet_v2(weights=weights)
 model.eval()
+preprocess = weights.transforms()
+categories = weights.meta["categories"]
 
-def preprocess_image(pil_image: Image.Image) -> torch.Tensor:
-    resized_img = pil_image.resize((128, 128))
-    img_arr = np.array(resized_img, dtype=np.float32) / 255.0
-    img_arr = np.transpose(img_arr, (2, 0, 1))
-
-    mean = np.array([0.485, 0.456, 0.406], dtype=np.float32).reshape(3, 1, 1)
-    std = np.array([0.229, 0.224, 0.225], dtype=np.float32).reshape(3, 1, 1)
-    normalized_arr = (img_arr - mean) / std
-
-    return torch.tensor(normalized_arr, dtype=torch.float32).unsqueeze(0).to(device)
-
-class ClassificationResponse(BaseModel):
+class PredictionItem(BaseModel):
     label: str
     confidence: float
-    cat_probability: float
-    dog_probability: float
-    verdict: str
+
+class PredictionResponse(BaseModel):
+    primary_class: str
+    confidence: float
     latency_ms: float
+    top_3: List[PredictionItem]
 
-@app.post("/api/predict", response_model=ClassificationResponse)
-async def predict_image(file: UploadFile = File(...)):
-    if not file.content_type.startswith("image/"):
-        raise HTTPException(status_code=400, detail="Please upload a valid image (PNG/JPG).")
-
+@app.post("/predict", response_model=PredictionResponse)
+async def predict(file: UploadFile = File(...)):
     try:
-        start_time = time.perf_counter()
         contents = await file.read()
-        pil_image = Image.open(io.BytesIO(contents)).convert("RGB")
-        tensor_image = preprocess_image(pil_image)
+        image = Image.open(io.BytesIO(contents)).convert("RGB")
 
+        start_time = time.perf_counter()
+
+        input_tensor = preprocess(image).unsqueeze(0)
         with torch.no_grad():
-            outputs = model(tensor_image)
-            probs = torch.softmax(outputs, dim=1)[0]
-            cat_prob = round(float(probs[0].item()) * 100, 2)
-            dog_prob = round(float(probs[1].item()) * 100, 2)
+            output = model(input_tensor)
+            probabilities = F.softmax(output[0], dim=0)
 
-        latency = round((time.perf_counter() - start_time) * 1000, 1)
+        # Get Top 3 Predictions
+        top_probs, top_catids = torch.topk(probabilities, 3)
+        latency_ms = round((time.perf_counter() - start_time) * 1000, 2)
 
-        if cat_prob > dog_prob:
-            label = "Cat"
-            confidence = cat_prob
-            verdict = f"Feline Detected ({cat_prob}%)"
-        else:
-            label = "Dog"
-            confidence = dog_prob
-            verdict = f"Canine Detected ({dog_prob}%)"
+        top_3_results = []
+        for prob, catid in zip(top_probs, top_catids):
+            raw_label = categories[catid.item()]
+            clean_name = raw_label.split(",")[0].replace("_", " ").title()
+            top_3_results.append(PredictionItem(
+                label=clean_name,
+                confidence=round(prob.item() * 100, 1)
+            ))
 
-        return ClassificationResponse(
-            label=label,
-            confidence=confidence,
-            cat_probability=cat_prob,
-            dog_probability=dog_prob,
-            verdict=verdict,
-            latency_ms=latency
+        primary = top_3_results[0]
+        return PredictionResponse(
+            primary_class=primary.label,
+            confidence=primary.confidence,
+            latency_ms=latency_ms,
+            top_3=top_3_results
         )
+
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/", response_class=HTMLResponse)
-def serve_home():
-    with open(os.path.join(FRONTEND_DIR, "index.html"), "r", encoding="utf-8") as f:
-        return f.read()
-
-@app.get("/app.js")
-def serve_js():
-    with open(os.path.join(FRONTEND_DIR, "app.js"), "r", encoding="utf-8") as f:
-        return Response(f.read(), media_type="application/javascript")
+app.mount("/", StaticFiles(directory="frontend", html=True), name="frontend")
